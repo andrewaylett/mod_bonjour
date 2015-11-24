@@ -210,6 +210,28 @@ static apr_status_t unregisterRefs( void* arg ) {
         free( registrationRecPtrs[i] );
     }
     module_cfg->registrationRecs->nelts = 0;
+		
+    hostRegistrationRec** hostRegistrationRecPtrs = NULL;
+    hostRegistrationRecPtrs = (hostRegistrationRec**)module_cfg->hostRegistrationRecs->elts;
+
+    for (i = 0; i < module_cfg->hostRegistrationRecs->nelts; i++) {
+        if (!hostRegistrationRecPtrs[i])
+            continue;
+		ap_log_error( APLOG_MARK, APLOG_NOERRNO|APLOG_DEBUG, 0, hostRegistrationRecPtrs[i]->serverData,
+            "%s DeRegistering '%s' from pid %d",
+            MSG_PREFIX, hostRegistrationRecPtrs[i]->name, getpid() );
+
+        if (hostRegistrationRecPtrs[i]->serviceRef) {
+            DNSServiceRefDeallocate( hostRegistrationRecPtrs[i]->serviceRef );
+			hostRegistrationRecPtrs[i]->serviceRef = 0;
+        }
+    }
+    for (i = 0; i < module_cfg->hostRegistrationRecs->nelts; i++) {
+        if (!hostRegistrationRecPtrs[i])
+            continue;
+        free( hostRegistrationRecPtrs[i] );
+    }
+    module_cfg->hostRegistrationRecs->nelts = 0;
 
 	resourceRec** resourceRecPtrs = NULL;
 	resourceRecPtrs = (resourceRec**)module_cfg->resourceRecs->elts;
@@ -396,7 +418,7 @@ static void registerHost( const char* inName, const char* targetName, server_rec
         free( hostRecPtr );
         return;
     }
-    printf("About to attempt registration");
+    printf("About to attempt registration\n");
 
 	DNSServiceErrorType regErr = DNSServiceRegisterRecord(hostRecPtr->serviceRef, &(hostRecPtr->recordRef), kDNSServiceFlagsShared, 0, regName, kDNSServiceType_CNAME, kDNSServiceClass_IN, dnsNameLen, dnsName, 0, &recordRegistrationCallback, serverData);
 
@@ -417,7 +439,7 @@ static void registerHost( const char* inName, const char* targetName, server_rec
 }
 
 void recordRegistrationCallback(DNSServiceRef sdRef, DNSRecordRef recordRef, DNSServiceFlags flags, DNSServiceErrorType errorCode, void *context) {
-  printf("In callback, context is ");
+  printf("In callback.\n");
   //server_rec *serverData = (server_rec*) context;
   //ap_log_error( APLOG_MARK, APLOG_NOERRNO|APLOG_INFO, 0, serverData,
   //    "Received callback from registering record");
