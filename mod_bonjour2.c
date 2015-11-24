@@ -78,6 +78,7 @@ the APIs.
 #include "http_connection.h" 
 #include "apr_strings.h"
 #include "apr_lib.h"
+#include <stdio.h>
 #include <unistd.h>
 #include <sys/stat.h>
 #include <pwd.h>
@@ -105,11 +106,26 @@ typedef struct resourceRec {
 	uint16_t port;
 } resourceRec;
 
+typedef struct vhostRec {
+        char* host;
+	char* name;
+	char* text;
+	char* protocol;
+	uint16_t port;
+} vhostRec;
+
 typedef struct registrationRec {	/* Needs to store info required to clean up upon deregistration */
     char name[REGNAME_MAX+1];
     DNSServiceRef serviceRef;
     server_rec* serverData;
 } registrationRec;
+
+typedef struct hostRegistrationRec {	/* Needs to store info required to clean up upon deregistration */
+    char name[REGNAME_MAX+1];
+    DNSServiceRef serviceRef;
+    DNSRecordRef recordRef;
+    server_rec* serverData;
+} hostRegistrationRec;
 
 typedef struct module_cfg_rec {
     apr_pool_t *pPool;
@@ -120,9 +136,12 @@ typedef struct module_cfg_rec {
 	char* protocol;
 	uint16_t port;
     apr_array_header_t *registrationRecs;
+    apr_array_header_t *hostRegistrationRecs;
     apr_array_header_t *resourceRecs;
+    apr_array_header_t *vhostRecs;
 	Boolean regUserSiteCmd;
 	Boolean regResourceCmd;
+	Boolean regVHostCmd;
 	Boolean regDefaultSiteCmd;
 } module_cfg_rec;
 // Revise to use array or hashes for mult-valued config items like regUserSite. See how mod_mime does it.
@@ -150,10 +169,12 @@ static void 	getTitle( char* inSiteFolder, char* outTitle, cmd_parms* cmd );
 static void     registerUsers( const char* whichUsers, const char* regNameFormat, 
 	uint16_t *port, cmd_parms *cmd );
 static const char *processRegDefaultSite( cmd_parms *cmd, void *dummy, const char *arg );
+static const char *processRegVHost( cmd_parms *cmd, void *dummy, const char *arg );
 static const char *processRegUserSite( cmd_parms *cmd, void *dummy, const char *inName,	
 	const char *inPort, const char *inHost );
 static const char *processRegResource( cmd_parms *cmd, __attribute__((unused)) void *dummy, 
 									  const char *arg );
+void recordRegistrationCallback(DNSServiceRef sdRef, DNSRecordRef recordRef, DNSServiceFlags flags, DNSServiceErrorType errorCode, void *context);
 static void 	*bonjourModuleCreateServerConfig( apr_pool_t *p, server_rec *serverData );
 static apr_uint32_t cksum(const unsigned char *mem, size_t size);
 static const apr_uint32_t crctab[];
@@ -198,6 +219,16 @@ static apr_status_t unregisterRefs( void* arg ) {
         free( resourceRecPtrs[i] );
     }
     module_cfg->resourceRecs->nelts = 0;
+
+    vhostRec** vhostRecPtrs = NULL;
+    vhostRecPtrs = (vhostRec**)module_cfg->vhostRecs->elts;
+    for (i=0; i < module_cfg->vhostRecs->nelts; i++) {
+      if (!vhostRecPtrs[i])
+	continue;
+      free(vhostRecPtrs[i]);
+    }
+    module_cfg->vhostRecs->nelts = 0;
+
     if (templateIndexMM) {
         close( templateIndexFD );
         munmap( templateIndexMM, (size_t)templateIndexFinfo.st_size );
@@ -261,6 +292,135 @@ static void registerService( const char* inName, uint16_t *inPort, char* inProto
 		
 	saveRegistrationRec = (registrationRec **)apr_array_push( module_cfg->registrationRecs );
 	*saveRegistrationRec = registrationRecPtr;
+}
+
+static int to_dns(const server_rec *serverData, const char *name, size_t nameLen, char *buf, size_t bufLen, size_t *written) {
+  uint8_t chunkLen = 0;
+  const char *ptr = name;
+  char charStr[2];
+
+  buf[0] = '\0';
+  
+  ap_log_error( APLOG_MARK, APLOG_NOERRNO|APLOG_DEBUG, 0, serverData,
+      "Starting conversion for hostname %s", name);
+
+  for (size_t i = 0; i < nameLen; i++) {
+    if (name[i] == '.') {
+      charStr[0] = chunkLen;
+      charStr[1] = '\0';
+      strncat(buf, charStr, bufLen - strlen(buf) - 1);
+      strncat(buf, ptr, MIN(bufLen - strlen(buf) - 1, chunkLen));
+      ptr = name + i + 1;
+      chunkLen = 0;
+    } else {
+      chunkLen++;
+    }
+  }
+
+  if (chunkLen > 0) {
+    charStr[0] = chunkLen;
+    charStr[1] = '\0';
+    strncat(buf, charStr, bufLen - strlen(buf) - 1);
+    strncat(buf, ptr, MIN(bufLen - strlen(buf) - 1, chunkLen));
+  }
+
+  *written = strlen(buf);
+
+  ap_log_error( APLOG_MARK, APLOG_NOERRNO|APLOG_DEBUG, 0, serverData,
+      "Wrote %lu bytes to DNS string", *written);
+
+  printf("\n");
+  for (size_t i = 0; i < *written; i++) {
+    printf("%d,", buf[i]);
+  }
+  printf("\n");
+
+  return 0;
+}
+
+/*
+* Register a host.
+*/
+static void registerHost( const char* inName, const char* targetName, server_rec* serverData) {
+    
+	char regName[MAX_NAME_FORMAT];
+    hostRegistrationRec** 	saveRegistrationRec;
+	server_cfg_rec *server_cfg = ap_get_module_config(serverData->module_config, &bonjour_module);
+    module_cfg_rec *module_cfg = server_cfg->module_cfg;
+
+    // Allocate a registrationRec structure; this will be used for deregistration.
+    hostRegistrationRec* hostRecPtr = (hostRegistrationRec*) malloc( sizeof(hostRegistrationRec) );
+    if (!hostRecPtr) {
+        ap_log_error( APLOG_MARK, APLOG_NOERRNO|APLOG_ERR, 0, serverData,
+            "%s Error allocating memory, cannot register '%s'.",
+            MSG_PREFIX, inName );
+        return;
+    }
+	
+    if (strlen(inName) >= MAX_NAME_FORMAT) {
+	        ap_log_error( APLOG_MARK, APLOG_NOERRNO|APLOG_WARNING, 0, serverData,
+            "%s Note that service name '%s' will be truncated to %d bytes.",
+            MSG_PREFIX, inName, MAX_NAME_FORMAT);
+	}
+	strlcpy(regName, inName, MAX_NAME_FORMAT);
+		
+    if (*regName)
+        strncpy( hostRecPtr->name, regName, sizeof(hostRecPtr->name) );
+
+    const size_t dnsNameBufLen = strlen(targetName) + 2;
+    char *dnsName = (char *)malloc(dnsNameBufLen);
+    if (!dnsName) {
+        ap_log_error( APLOG_MARK, APLOG_NOERRNO|APLOG_ERR, 0, serverData,
+            "%s Error allocating memory, cannot register '%s'.",
+            MSG_PREFIX, inName );
+        return;
+    }
+    size_t dnsNameLen = 0;
+    int toDnsError = to_dns(serverData, targetName, strlen(targetName), dnsName, dnsNameBufLen, &dnsNameLen);
+    if (toDnsError != 0) {
+        ap_log_error( APLOG_MARK, APLOG_NOERRNO|APLOG_ERR, 0, serverData,
+            "%s Error %d trying to create DNS name to register '%s' from pid=%d.",
+            MSG_PREFIX, toDnsError, regName, getpid() );
+        free( hostRecPtr );
+	free( dnsName );
+        return;
+    }
+
+    hostRecPtr->serverData = serverData;
+        
+    DNSServiceErrorType conErr = DNSServiceCreateConnection(&(hostRecPtr->serviceRef));
+    if (conErr != kDNSServiceErr_NoError || !hostRecPtr->serviceRef) {
+        ap_log_error( APLOG_MARK, APLOG_NOERRNO|APLOG_ERR, 0, serverData,
+            "%s Error %d trying to create service connection to register '%s' from pid=%d.",
+            MSG_PREFIX, conErr, regName, getpid() );
+        free( hostRecPtr );
+        return;
+    }
+    printf("About to attempt registration");
+
+	DNSServiceErrorType regErr = DNSServiceRegisterRecord(hostRecPtr->serviceRef, &(hostRecPtr->recordRef), kDNSServiceFlagsShared, 0, regName, kDNSServiceType_CNAME, kDNSServiceClass_IN, dnsNameLen, dnsName, 0, &recordRegistrationCallback, serverData);
+
+    if (regErr != kDNSServiceErr_NoError) {
+        ap_log_error( APLOG_MARK, APLOG_NOERRNO|APLOG_ERR, 0, serverData,
+            "%s Error %d trying to register record '%s' to '%s' from pid=%d.",
+            MSG_PREFIX, regErr, regName, targetName, getpid() );
+        free( hostRecPtr );
+        return;
+    }
+    
+    ap_log_error( APLOG_MARK, APLOG_NOERRNO|APLOG_INFO, 0, serverData,
+        "%s Registered name='%s' txt='%s' from pid=%d.",
+        MSG_PREFIX, regName, targetName, getpid() );
+		
+	saveRegistrationRec = (hostRegistrationRec **)apr_array_push( module_cfg->hostRegistrationRecs );
+	*saveRegistrationRec = hostRecPtr;
+}
+
+void recordRegistrationCallback(DNSServiceRef sdRef, DNSRecordRef recordRef, DNSServiceFlags flags, DNSServiceErrorType errorCode, void *context) {
+  printf("In callback, context is ");
+  //server_rec *serverData = (server_rec*) context;
+  //ap_log_error( APLOG_MARK, APLOG_NOERRNO|APLOG_INFO, 0, serverData,
+  //    "Received callback from registering record");
 }
 
 
@@ -823,24 +983,24 @@ static void registerUser( const char* inUserName, const char* inRegNameFormat,
                     case 't':	// %t - HTML title
                         getTitle( site_path, (char*)&title, cmd );
                         if (*title && strcmp( title, "" )) {
-                            strncat( regName, title, sizeof(regName) );
+                            strncat( regName, title, sizeof(regName) - strlen(regName) - 1 );
                             j = j + strlen( title );
                         }
                         i++;
                         break;
                     case 'l':	// %l - long name
-                        strncat( regName, pw->pw_gecos, sizeof(regName) );
+                        strncat( regName, pw->pw_gecos, sizeof(regName) - strlen(regName) - 1 );
                         j = j + strlen( pw->pw_gecos );
                         i++;
                         break;
                     case 'n':	// %n - short name
-                        strncat( regName, pw->pw_name, sizeof(regName) );
+                        strncat( regName, pw->pw_name, sizeof(regName) - strlen(regName) - 1 );
                         j = j + strlen( pw->pw_name );
                         i++;
                         break;
                     case 'u':	// %u - uid
                         snprintf( uidStr, sizeof(uidStr), "%d", pw->pw_uid );
-                        strncat( regName, uidStr, sizeof(regName) );
+                        strncat( regName, uidStr, sizeof(regName) - strlen(regName) - 1 );
                         j = j + strlen( uidStr );
                         i++;
                         break;
@@ -849,7 +1009,7 @@ static void registerUser( const char* inUserName, const char* inRegNameFormat,
 						if (!hostRef)
 							hostRef = CFSTR("");
                         CFStringGetCString( hostRef, hostStr, sizeof(hostStr), kCFStringEncodingMacRoman ); 
-                        strncat( regName, hostStr, sizeof(regName) );
+                        strncat( regName, hostStr, sizeof(regName) - strlen(regName) - 1 );
                         j = j + strlen( hostStr );
                         i++;
                         break;
@@ -1000,6 +1160,8 @@ static const char *processRegDefaultSite( cmd_parms *cmd, __attribute__((unused)
 			"%s Processing stopped because this is the DSO preflight, not the actual run. pid=%d", MSG_PREFIX, getpid());
        return NULL;
     }
+    ap_log_error( APLOG_MARK, APLOG_NOERRNO|APLOG_DEBUG, 0, NULL,
+	    "%s Processing continuing because this is the actual run. pid=%d", MSG_PREFIX, getpid());
 		
 	server_cfg_rec *server_cfg = ap_get_module_config(cmd->server->module_config, &bonjour_module);
     module_cfg_rec *module_cfg = server_cfg->module_cfg;
@@ -1040,6 +1202,7 @@ static const char *processRegDefaultSite( cmd_parms *cmd, __attribute__((unused)
 
     return NULL;
 }
+
 /*
  * Process the RegisterUserSite directive. Just save config
  * RegisterUserSite username | all-users 
@@ -1139,11 +1302,11 @@ static const char *processRegResource( cmd_parms *cmd, __attribute__((unused)) v
 	        switch (nameArg[i + 1]) {
 	            case 's':	// %s - server name if available
 					if (cmd->server->server_hostname) {
-	                	strncat( regName, cmd->server->server_hostname, sizeof(regName) );
+	                	strncat( regName, cmd->server->server_hostname, sizeof(regName) - strlen(regName) - 1 );
 		                j = j + strlen( cmd->server->server_hostname );
 					}
 					else {
-	                	strncat( regName, "*", sizeof(regName) );
+	                	strncat( regName, "*", sizeof(regName) - strlen(regName) - 1 );
 	                	j = j + strlen( "*" );
 					}
 	                i++;
@@ -1153,7 +1316,7 @@ static const char *processRegResource( cmd_parms *cmd, __attribute__((unused)) v
 					if (!hostRef)
 						hostRef = CFSTR("");
 	                CFStringGetCString( hostRef, hostStr, sizeof(hostStr), kCFStringEncodingMacRoman ); 
-	                strncat( regName, hostStr, sizeof(regName) );
+	                strncat( regName, hostStr, sizeof(regName) - strlen(regName) - 1 );
 	                j = j + strlen( hostStr );
 	                i++;
 	                break;
@@ -1209,11 +1372,126 @@ static const char *processRegResource( cmd_parms *cmd, __attribute__((unused)) v
     return NULL;
 }
 
+/*
+ * Process the RegisterVHost directive.
+ * RegisterResource name path [port | main] [[protocol]]
+ */
+static const char *processRegVHost( cmd_parms *cmd, __attribute__((unused)) void *dummy, 
+									  const char *arg ) {
+
+	uint16_t port = DEFAULT_HTTP_PORT;
+	char* protocol = "http";
+    int err = 0;
+
+	server_cfg_rec *server_cfg = ap_get_module_config(cmd->server->module_config, &bonjour_module);
+    module_cfg_rec *module_cfg = server_cfg->module_cfg;
+
+    const char *errString = ap_check_cmd_context( cmd, NOT_IN_DIR_LOC_FILE );
+    if (errString != NULL) {
+        return errString;
+    }
+    
+    char* nameArg = ap_getword_conf( cmd->pool, &arg );
+    if (nameArg && strcmp(nameArg, "" ))
+        if (strlen( nameArg ) > REGNAME_MAX)
+            return apr_pstrcat( cmd->pool, MSG_PREFIX, "Name argument too long", NULL );
+
+	// Format string
+	int len = strlen(nameArg);
+	int i;
+	int j = 0;
+    CFStringRef hostRef;
+	char hostStr[65];
+    char regName[REGNAME_MAX+1];
+	bzero( regName, sizeof(regName) );
+	for (i = 0; i < len; i++) {
+	    if (nameArg[i] == '%') {
+	        switch (nameArg[i + 1]) {
+	            case 's':	// %s - server name if available
+					if (cmd->server->server_hostname) {
+	                	strncat( regName, cmd->server->server_hostname, sizeof(regName) - strlen(regName) - 1 );
+		                j = j + strlen( cmd->server->server_hostname );
+					}
+					else {
+	                	strncat( regName, "*", sizeof(regName) - strlen(regName) - 1 );
+	                	j = j + strlen( "*" );
+					}
+	                i++;
+	                break;
+	            case 'c':	// %c - computer name
+	                hostRef = SCDynamicStoreCopyComputerName( NULL, NULL );
+					if (!hostRef)
+						hostRef = CFSTR("");
+	                CFStringGetCString( hostRef, hostStr, sizeof(hostStr), kCFStringEncodingMacRoman ); 
+	                strncat( regName, hostStr, sizeof(regName) - strlen(regName) - 1 );
+	                j = j + strlen( hostStr );
+	                i++;
+	                break;
+	            default:
+	                regName[j++] = nameArg[i];
+	        }
+	    }
+	    else
+	        regName[j++] = nameArg[i];
+	}
+            
+	char* pathArg = ap_getword_conf( cmd->pool, &arg );
+	if (pathArg && strcmp(pathArg, "" )) {
+        if (strlen( pathArg ) > PATH_MAX)
+            return apr_pstrcat( cmd->pool, MSG_PREFIX, "Path argument too long to be a path", NULL );
+        if (strlen( pathArg ) > TXT_MAX - 6) // allow space for "path="
+            return apr_pstrcat( cmd->pool, MSG_PREFIX, "Path argument too long to use with Bonjour", NULL );
+    }
+    
+	char* portArg = ap_getword_conf( cmd->pool, &arg );
+    if (portArg && strcmp( portArg, "" )) {
+        if (strlen( portArg ) > 5)
+            return apr_pstrcat( cmd->pool, MSG_PREFIX, "Port argument too long", NULL );
+
+        if (!strcasecmp( portArg, "main" ))	{ // use port of main server
+			if (cmd->server->port)
+				port = cmd->server->port;
+		} else {
+            err = sscanf( portArg, "%" PRIu16, &port );
+            if (!err)
+                return apr_pstrcat( cmd->pool, MSG_PREFIX, "Port argument not 'main' or numeric", NULL );
+        }
+    }
+	
+    char* protocolArg = ap_getword_conf( cmd->pool, &arg );
+    if (protocolArg && strcmp( protocolArg, "" )) {
+        if (strlen( protocolArg ) > PROTOCOL_MAX)
+            return apr_pstrcat( cmd->pool, MSG_PREFIX, "Protocol argument too long", NULL );
+		protocol = apr_pstrdup( cmd->pool, protocolArg );
+    }
+	
+	//resourceRec* resource = apr_palloc( module_cfg->pPool, sizeof(resourceRec) );	// pool?
+    vhostRec* resource = (vhostRec*) malloc( sizeof(vhostRec) );
+    resource->host = apr_pstrdup( cmd->pool, cmd->server->server_hostname );
+	resource->name = apr_pstrdup( cmd->pool, regName );
+	resource->text = apr_pstrdup( cmd->pool, pathArg );
+	resource->port = port;
+	resource->protocol = protocol;
+	vhostRec** saveResource = (vhostRec **)apr_array_push( module_cfg->vhostRecs );
+	*saveResource = resource;
+	
+	module_cfg->regVHostCmd = TRUE;	// ?
+
+    return NULL;
+}
+
 
 static command_rec bonjourModuleCmds[]=
     {
     AP_INIT_RAW_ARGS("RegisterDefaultSite", 
 		processRegDefaultSite, 
+		NULL, 
+		RSRC_CONF,
+		"Optionally, specify a port or keyword main; default is 80, "
+		"optionally followed by a protocol; default is http which means _http._tcp"
+	),
+    AP_INIT_RAW_ARGS("RegisterVHost", 
+		processRegVHost, 
 		NULL, 
 		RSRC_CONF,
 		"Optionally, specify a port or keyword main; default is 80, "
@@ -1298,6 +1576,17 @@ static int bonjourPostConfig( apr_pool_t *p, __attribute__((unused)) apr_pool_t 
 		}
 	}
 	
+	if (module_cfg->regVHostCmd) {
+		int i;
+		vhostRec** resourceRecPtrs = NULL;
+		resourceRecPtrs = (vhostRec**)module_cfg->vhostRecs->elts;
+		for (i = 0; i < module_cfg->vhostRecs->nelts; i++) {
+			if (!resourceRecPtrs[i])
+				continue;
+			registerHost( resourceRecPtrs[i]->name, "andrayle01m.local.", serverData );
+		}
+	}
+	
 	if (module_cfg->regDefaultSiteCmd)
         registerService( "", &module_cfg->port, module_cfg->protocol, "", serverData );
 
@@ -1344,9 +1633,12 @@ static void *bonjourModuleCreateServerConfig( apr_pool_t *p, server_rec *serverD
 	 */
 	module_cfg->pPool = pPool;
 	module_cfg->registrationRecs = apr_array_make( pPool, 0, sizeof(registrationRec*) );
+	module_cfg->hostRegistrationRecs = apr_array_make( pPool, 0, sizeof(hostRegistrationRec*) );
 	module_cfg->resourceRecs = apr_array_make( pPool, 0, sizeof(resourceRec*) );
+	module_cfg->vhostRecs = apr_array_make( pPool, 0, sizeof(vhostRec*) );
 	module_cfg->regUserSiteCmd = FALSE;
 	module_cfg->regResourceCmd = FALSE;
+	module_cfg->regVHostCmd = FALSE;
 	module_cfg->regDefaultSiteCmd = FALSE;
 
 	apr_pool_userdata_set(module_cfg, BONJOUR_KEY, apr_pool_cleanup_null, pPool);
