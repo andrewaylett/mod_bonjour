@@ -363,7 +363,7 @@ static int to_dns(const server_rec *serverData, const char *name, size_t nameLen
 /*
 * Register a host.
 */
-static void registerHost( const char* inName, const char* targetName, server_rec* serverData) {
+static void registerHost( const char* inName, server_rec* serverData) {
     
 	char regName[MAX_NAME_FORMAT];
     hostRegistrationRec** 	saveRegistrationRec;
@@ -389,7 +389,8 @@ static void registerHost( const char* inName, const char* targetName, server_rec
     if (*regName)
         strncpy( hostRecPtr->name, regName, sizeof(hostRecPtr->name) );
 
-    const size_t dnsNameBufLen = strlen(targetName) + 2;
+    const char *targetName = serverData->server_hostname;
+    const size_t dnsNameBufLen = strlen(targetName) + 3;
     char *dnsName = (char *)malloc(dnsNameBufLen);
     if (!dnsName) {
         ap_log_error( APLOG_MARK, APLOG_NOERRNO|APLOG_ERR, 0, serverData,
@@ -1605,7 +1606,7 @@ static int bonjourPostConfig( apr_pool_t *p, __attribute__((unused)) apr_pool_t 
 		for (i = 0; i < module_cfg->vhostRecs->nelts; i++) {
 			if (!resourceRecPtrs[i])
 				continue;
-			registerHost( resourceRecPtrs[i]->name, "andrayle01m.local.", serverData );
+			registerHost( resourceRecPtrs[i]->name, serverData );
 		}
 	}
 	
